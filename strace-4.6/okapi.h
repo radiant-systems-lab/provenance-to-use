@@ -47,6 +47,7 @@ char* format(const char *format, ...);
 
 char* realpath_strdup(char* filename);
 char* readlink_strdup(char* filename);
+char* resolve_dirfd_path(int pid, int dirfd);
 
 char* realpath_nofollow_DEPRECATED(char* filename, char* relative_path_basedir);
 

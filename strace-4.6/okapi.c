@@ -112,6 +112,34 @@ char* readlink_strdup(char* filename) {
   return strdup(path);
 }
 
+// resolves a directory file descriptor to its path using /proc/pid/fd/%d
+// returns NULL on failure, caller must free the returned string
+char* resolve_dirfd_path(int pid, int dirfd) {
+  char proc_fd_path[256];
+  char resolved_path[MAXPATHLEN];
+  
+  // construct /proc/pid/fd/dirfd path
+  snprintf(proc_fd_path, sizeof(proc_fd_path), "/proc/%d/fd/%d", pid, dirfd);
+  
+  // use readlink to resolve the file descriptor to actual path
+  int len = readlink(proc_fd_path, resolved_path, sizeof(resolved_path) - 1);
+  if (len < 0) {
+    // readlink failed - fd might be invalid or not a directory
+    return NULL;
+  }
+  
+  resolved_path[len] = '\0'; // readlink doesn't null-terminate
+  
+  // verify this is a directory by checking if we can access it
+  struct stat st;
+  if (stat(resolved_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    // path is not accessible or not a directory
+    return NULL;
+  }
+  
+  return strdup(resolved_path);
+}
+
 
 // representing and manipulating path components
 // (code courtesy of the Goanna project,

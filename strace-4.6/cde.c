@@ -647,29 +647,14 @@ extern int isspace(int c);
 #define STRING_ISGRAPHIC(c) ( ((c) == '\t' || (isascii (c) && isprint (c))) )
 
 
-// modify a single argument to the given system call
-// to a path within cde-root/, if applicable
-//
-// arg_num == 1 mean modify first register arg
-// arg_num == 2 mean modify second register arg
-static void modify_syscall_single_arg(struct tcb* tcp, int arg_num, char* filename) {
+// Helper function to directly modify syscall argument with an already redirected path
+// This function handles the low-level ptrace register modification
+static void modify_syscall_arg_direct(struct tcb* tcp, int arg_num, char* redirected_filename) {
   assert(Cde_exec_mode);
-  assert(filename);
-
-  //printf("from '%s' ", filename);
-  char* redirected_filename =
-    redirect_filename_into_cderoot(filename, tcp->current_dir, tcp);
-  if (!redirected_filename) {
-    return;
-  }
-  //printf("to '%s %s'\n", redirected_filename); // quanpt
+  assert(redirected_filename);
 
   if (!tcp->childshm) {
     begin_setup_shmat(tcp);
-
-    // no more need for filename, so don't leak it
-    free(redirected_filename);
-
     return; // MUST punt early here!!!
   }
 
@@ -713,9 +698,33 @@ static void modify_syscall_single_arg(struct tcb* tcp, int arg_num, char* filena
   }
 
   ptrace(PTRACE_SETREGS, tcp->pid, NULL, (long)&cur_regs);
+}
 
+// modify a single argument to the given system call
+// to a path within cde-root/, if applicable
+//
+// arg_num == 1 mean modify first register arg
+// arg_num == 2 mean modify second register arg
+// base_dir == NULL means use tcp->current_dir (for backward compatibility)
+static void modify_syscall_single_arg(struct tcb* tcp, int arg_num, char* filename, char* base_dir) {
+  assert(Cde_exec_mode);
+  assert(filename);
+
+  // Use provided base_dir or fall back to tcp->current_dir for backward compatibility
+  char* effective_base_dir = base_dir ? base_dir : tcp->current_dir;
+
+  //printf("from '%s' ", filename);
+  char* redirected_filename =
+    redirect_filename_into_cderoot(filename, effective_base_dir, tcp);
+  if (!redirected_filename) {
+    return;
+  }
+  //printf("to '%s %s'\n", redirected_filename); // quanpt
+
+  modify_syscall_arg_direct(tcp, arg_num, redirected_filename);
   free(redirected_filename);
 }
+
 
 
 // copy and paste from modify_syscall_first_arg ;)
@@ -824,13 +833,36 @@ static void modify_syscall_second_and_fourth_args(struct tcb* tcp) {
   }
 
   char* filename1 = strcpy_from_child(tcp, tcp->u_arg[1]);
+  char* filename2 = strcpy_from_child(tcp, tcp->u_arg[3]);
+  
+  // Determine base directories for each path
+  char* base_dir1 = tcp->current_dir;
+  char* base_dir2 = tcp->current_dir;
+  char* resolved_dirfd1 = NULL;
+  char* resolved_dirfd2 = NULL;
+  
+  // Check first path (arg[1] with dirfd arg[0])
+  if (!IS_ABSPATH(filename1) && tcp->u_arg[0] != AT_FDCWD) {
+    resolved_dirfd1 = resolve_dirfd_path(tcp->pid, tcp->u_arg[0]);
+    if (resolved_dirfd1) {
+      base_dir1 = resolved_dirfd1;
+    }
+  }
+  
+  // Check second path (arg[3] with dirfd arg[2])
+  if (!IS_ABSPATH(filename2) && tcp->u_arg[2] != AT_FDCWD) {
+    resolved_dirfd2 = resolve_dirfd_path(tcp->pid, tcp->u_arg[2]);
+    if (resolved_dirfd2) {
+      base_dir2 = resolved_dirfd2;
+    }
+  }
+  
   char* redirected_filename1 =
-    redirect_filename_into_cderoot(filename1, tcp->current_dir, tcp);
+    redirect_filename_into_cderoot(filename1, base_dir1, tcp);
   free(filename1);
 
-  char* filename2 = strcpy_from_child(tcp, tcp->u_arg[3]);
   char* redirected_filename2 =
-    redirect_filename_into_cderoot(filename2, tcp->current_dir, tcp);
+    redirect_filename_into_cderoot(filename2, base_dir2, tcp);
   free(filename2);
 
   // gotta do both, yuck
@@ -901,6 +933,8 @@ static void modify_syscall_second_and_fourth_args(struct tcb* tcp) {
 
   if (redirected_filename1) free(redirected_filename1);
   if (redirected_filename2) free(redirected_filename2);
+  if (resolved_dirfd1) free(resolved_dirfd1);
+  if (resolved_dirfd2) free(resolved_dirfd2);
 }
 
 // modify the first and third args to redirect into cde-root/
@@ -919,8 +953,19 @@ static void modify_syscall_first_and_third_args(struct tcb* tcp) {
   free(filename1);
 
   char* filename2 = strcpy_from_child(tcp, tcp->u_arg[2]);
+  char* base_dir2 = tcp->current_dir;
+  char* resolved_dirfd2 = NULL;
+  
+  // Check second path (filename2 with dirfd arg[1])
+  if (!IS_ABSPATH(filename2) && tcp->u_arg[1] != AT_FDCWD) {
+    resolved_dirfd2 = resolve_dirfd_path(tcp->pid, tcp->u_arg[1]);
+    if (resolved_dirfd2) {
+      base_dir2 = resolved_dirfd2;
+    }
+  }
+  
   char* redirected_filename2 =
-    redirect_filename_into_cderoot(filename2, tcp->current_dir, tcp);
+    redirect_filename_into_cderoot(filename2, base_dir2, tcp);
   free(filename2);
 
   // gotta do both, yuck
@@ -991,6 +1036,7 @@ static void modify_syscall_first_and_third_args(struct tcb* tcp) {
 
   if (redirected_filename1) free(redirected_filename1);
   if (redirected_filename2) free(redirected_filename2);
+  if (resolved_dirfd2) free(resolved_dirfd2);
 }
 
 
@@ -1108,7 +1154,7 @@ void CDE_begin_standard_fileop(struct tcb* tcp, const char* syscall_name) {
 
   if (Cde_exec_mode) {
     if (filename) {
-      modify_syscall_single_arg(tcp, 1, filename);
+      modify_syscall_single_arg(tcp, 1, filename, NULL);
     }
   }
   else {
@@ -1146,26 +1192,33 @@ void CDE_begin_standard_fileop(struct tcb* tcp, const char* syscall_name) {
 */
 void CDE_begin_at_fileop(struct tcb* tcp, const char* syscall_name) {
   char* filename = strcpy_from_child(tcp, tcp->u_arg[1]);
+  char* effective_base_dir = tcp->current_dir;
+  char* resolved_dirfd_path = NULL;
 
   if (Cde_verbose_mode) {
     vbprintf("[%d] BEGIN %s '%s' (dirfd=%u)\n", tcp->pid, syscall_name, filename, (unsigned int)tcp->u_arg[0]);
   }
 
+  // Handle relative paths with custom dirfd by resolving the dirfd path
   if (!IS_ABSPATH(filename) && tcp->u_arg[0] != AT_FDCWD) {
-      // raza - the following two statements are commented out
-      // to remove the error for relative file names
-      // in ptu execution mode (in sciunit repeat).
-      // all tests are passing after commenting them out
-      // todo: revisit and possibly remove if solution doesn't work
-
-//    fprintf(stderr,
-//            "CDE WARNING (unsupported operation): %s '%s' is a relative path and dirfd != AT_FDCWD\n",
-//            syscall_name, filename);
-//    goto done; // punt early!
+    resolved_dirfd_path = resolve_dirfd_path(tcp->pid, tcp->u_arg[0]);
+    if (resolved_dirfd_path) {
+      effective_base_dir = resolved_dirfd_path;
+      if (Cde_verbose_mode) {
+        vbprintf("[%d] Resolved dirfd %d to path '%s'\n", tcp->pid, (int)tcp->u_arg[0], resolved_dirfd_path);
+      }
+    } else {
+      // Fall back to warning if we can't resolve the dirfd
+      fprintf(stderr,
+              "CDE WARNING (unsupported operation): %s '%s' is a relative path and dirfd %d could not be resolved\n",
+              syscall_name, filename, (int)tcp->u_arg[0]);
+      goto done;
+    }
   }
 
   if (Cde_exec_mode) {
-    modify_syscall_single_arg(tcp, 2, filename);
+    // Use the new function that handles custom base directory properly
+    modify_syscall_single_arg(tcp, 2, filename, effective_base_dir);
   }
   else {
     if (get_repo_path_id(filename)>=0) // quanpt
@@ -1174,10 +1227,13 @@ void CDE_begin_at_fileop(struct tcb* tcp, const char* syscall_name) {
     // non-existent files.
     // (Note that filename can sometimes be a JUNKY STRING due to weird race
     //  conditions when strace is tracing complex multi-process applications)
-    copy_file_into_cde_root(filename, tcp->current_dir);
+    copy_file_into_cde_root(filename, effective_base_dir);
   }
 
 done:
+  if (resolved_dirfd_path) {
+    free(resolved_dirfd_path);
+  }
   free(filename);
 }
 
@@ -1509,7 +1565,7 @@ void CDE_begin_execve(struct tcb* tcp) {
       // binary, so let the execve call proceed normally
       if (Cde_exec_mode) {
         // redirect the executable's path to within $CDE_ROOT_DIR:
-        modify_syscall_single_arg(tcp, 1, exe_filename);
+        modify_syscall_single_arg(tcp, 1, exe_filename, NULL);
       }
       else {
         copy_file_into_cde_root(exe_filename, tcp->current_dir);
@@ -1597,7 +1653,7 @@ void CDE_begin_execve(struct tcb* tcp) {
       // need to do something better here (think harder about this case!)
       if (Cde_exec_mode) {
         // redirect the executable's path to within cde-root/:
-        modify_syscall_single_arg(tcp, 1, exe_filename);
+        modify_syscall_single_arg(tcp, 1, exe_filename, NULL);
       }
 
       goto done;
@@ -2024,7 +2080,7 @@ void CDE_begin_execve(struct tcb* tcp) {
       }
       else {
         // simply redirect the executable's path to within cde-root/:
-        modify_syscall_single_arg(tcp, 1, exe_filename);
+        modify_syscall_single_arg(tcp, 1, exe_filename, NULL);
         //~ is_runable_count += 4;
       }
     }
@@ -2144,7 +2200,7 @@ void CDE_begin_file_unlink(struct tcb* tcp) {
   }
 
   if (Cde_exec_mode) {
-    modify_syscall_single_arg(tcp, 1, filename);
+    modify_syscall_single_arg(tcp, 1, filename, NULL);
   }
   else {
     char* redirected_path = redirect_filename_into_cderoot(filename, tcp->current_dir, tcp);
@@ -2160,26 +2216,45 @@ void CDE_begin_file_unlink(struct tcb* tcp) {
 //   int unlinkat(int dirfd, const char *pathname, int flags);
 void CDE_begin_file_unlinkat(struct tcb* tcp) {
   char* filename = strcpy_from_child(tcp, tcp->u_arg[1]);
+  char* effective_base_dir = tcp->current_dir;
+  char* resolved_dirfd_path = NULL;
 
   if (Cde_verbose_mode) {
-    vbprintf("[%d] BEGIN unlinkat '%s'\n", tcp->pid, filename);
+    vbprintf("[%d] BEGIN unlinkat '%s' (dirfd=%u)\n", tcp->pid, filename, (unsigned int)tcp->u_arg[0]);
   }
 
+  // Handle relative paths with custom dirfd by resolving the dirfd path
   if (!IS_ABSPATH(filename) && tcp->u_arg[0] != AT_FDCWD) {
-    fprintf(stderr, "CDE WARNING: unlinkat '%s' is a relative path and dirfd != AT_FDCWD\n", filename);
-    return; // punt early!
+    resolved_dirfd_path = resolve_dirfd_path(tcp->pid, tcp->u_arg[0]);
+    if (resolved_dirfd_path) {
+      effective_base_dir = resolved_dirfd_path;
+      if (Cde_verbose_mode) {
+        vbprintf("[%d] Resolved dirfd %d to path '%s'\n", tcp->pid, (int)tcp->u_arg[0], resolved_dirfd_path);
+      }
+    } else {
+      fprintf(stderr, "CDE WARNING: unlinkat '%s' is a relative path and dirfd %d could not be resolved\n", 
+              filename, (int)tcp->u_arg[0]);
+      goto done; // punt early!
+    }
   }
 
   if (Cde_exec_mode) {
-    modify_syscall_single_arg(tcp, 2, filename);
+    // Use the new function that handles custom base directory properly
+    modify_syscall_single_arg(tcp, 2, filename, effective_base_dir);
   }
   else {
-    char* redirected_path = redirect_filename_into_cderoot(filename, tcp->current_dir, tcp);
+    char* redirected_path = redirect_filename_into_cderoot(filename, effective_base_dir, tcp);
     if (redirected_path) {
       unlink(redirected_path);
       free(redirected_path);
     }
   }
+
+done:
+  if (resolved_dirfd_path) {
+    free(resolved_dirfd_path);
+  }
+  free(filename);
 }
 
 
@@ -2227,20 +2302,6 @@ void CDE_begin_file_linkat(struct tcb* tcp) {
     vbprintf("[%d] BEGIN linkat(%s, %s)\n", tcp->pid, oldpath, newpath);
   }
 
-  if (!IS_ABSPATH(oldpath) && tcp->u_arg[0] != AT_FDCWD) {
-    fprintf(stderr,
-            "CDE WARNING: linkat '%s' is a relative path and dirfd != AT_FDCWD\n",
-            oldpath);
-    goto done; // punt early!
-  }
-  if (!IS_ABSPATH(newpath) && tcp->u_arg[2] != AT_FDCWD) {
-    fprintf(stderr,
-            "CDE WARNING: linkat '%s' is a relative path and dirfd != AT_FDCWD\n",
-            newpath);
-    goto done; // punt early!
-  }
-
-
   if (Cde_exec_mode) {
     modify_syscall_second_and_fourth_args(tcp);
   }
@@ -2249,19 +2310,42 @@ void CDE_begin_file_linkat(struct tcb* tcp) {
     // TODO: is this too early since the original link hasn't been done yet?
     // (I don't think so ...)
     //
-    char* redirected_oldpath = redirect_filename_into_cderoot(oldpath, tcp->current_dir, tcp);
+    // Determine base directories for each path
+    char* base_dir1 = tcp->current_dir;
+    char* base_dir2 = tcp->current_dir;
+    char* resolved_dirfd1 = NULL;
+    char* resolved_dirfd2 = NULL;
+    
+    // Check first path (oldpath with dirfd arg[0])
+    if (!IS_ABSPATH(oldpath) && tcp->u_arg[0] != AT_FDCWD) {
+      resolved_dirfd1 = resolve_dirfd_path(tcp->pid, tcp->u_arg[0]);
+      if (resolved_dirfd1) {
+        base_dir1 = resolved_dirfd1;
+      }
+    }
+    
+    // Check second path (newpath with dirfd arg[2])
+    if (!IS_ABSPATH(newpath) && tcp->u_arg[2] != AT_FDCWD) {
+      resolved_dirfd2 = resolve_dirfd_path(tcp->pid, tcp->u_arg[2]);
+      if (resolved_dirfd2) {
+        base_dir2 = resolved_dirfd2;
+      }
+    }
+    
+    char* redirected_oldpath = redirect_filename_into_cderoot(oldpath, base_dir1, tcp);
     // first copy the origin file into cde-root/ before trying to link it
-    copy_file_into_cde_root(oldpath, tcp->current_dir);
+    copy_file_into_cde_root(oldpath, base_dir1);
 
-    char* redirected_newpath = redirect_filename_into_cderoot(newpath, tcp->current_dir, tcp);
+    char* redirected_newpath = redirect_filename_into_cderoot(newpath, base_dir2, tcp);
 
     link(redirected_oldpath, redirected_newpath);
 
     free(redirected_oldpath);
     free(redirected_newpath);
+    if (resolved_dirfd1) free(resolved_dirfd1);
+    if (resolved_dirfd2) free(resolved_dirfd2);
   }
 
-done:
   free(oldpath);
   free(newpath);
 }
@@ -2302,22 +2386,29 @@ void CDE_begin_file_symlinkat(struct tcb* tcp) {
 
   char* newpath = strcpy_from_child(tcp, tcp->u_arg[2]);
 
-  if (!IS_ABSPATH(newpath) && tcp->u_arg[1] != AT_FDCWD) {
-    fprintf(stderr, "CDE WARNING: symlinkat '%s' is a relative path and dirfd != AT_FDCWD\n", newpath);
-    free(newpath);
-    return; // punt early!
-  }
-
   if (Cde_exec_mode) {
     modify_syscall_first_and_third_args(tcp);
   }
   else {
+    // Determine base directory for newpath
+    char* base_dir = tcp->current_dir;
+    char* resolved_dirfd = NULL;
+    
+    // Check newpath (arg[2] with dirfd arg[1])
+    if (!IS_ABSPATH(newpath) && tcp->u_arg[1] != AT_FDCWD) {
+      resolved_dirfd = resolve_dirfd_path(tcp->pid, tcp->u_arg[1]);
+      if (resolved_dirfd) {
+        base_dir = resolved_dirfd;
+      }
+    }
+    
     char* oldname = strcpy_from_child(tcp, tcp->u_arg[0]);
-    char* newpath_redirected = redirect_filename_into_cderoot(newpath, tcp->current_dir, tcp);
+    char* newpath_redirected = redirect_filename_into_cderoot(newpath, base_dir, tcp);
     symlink(oldname, newpath_redirected);
 
     free(oldname);
     free(newpath_redirected);
+    if (resolved_dirfd) free(resolved_dirfd);
   }
 
   free(newpath);
@@ -2374,24 +2465,46 @@ void CDE_begin_file_renameat(struct tcb* tcp) {
   char* oldpath = strcpy_from_child(tcp, tcp->u_arg[1]);
   char* newpath = strcpy_from_child(tcp, tcp->u_arg[3]);
 
-  if (!IS_ABSPATH(oldpath) && tcp->u_arg[0] != AT_FDCWD) {
-    fprintf(stderr,
-            "CDE WARNING: renameat '%s' is a relative path and dirfd != AT_FDCWD\n",
-            oldpath);
-    goto done; // punt early!
-  }
-  if (!IS_ABSPATH(newpath) && tcp->u_arg[2] != AT_FDCWD) {
-    fprintf(stderr,
-            "CDE WARNING: renameat '%s' is a relative path and dirfd != AT_FDCWD\n",
-            newpath);
-    goto done; // punt early!
-  }
-
   if (Cde_exec_mode) {
     modify_syscall_second_and_fourth_args(tcp);
   }
+  else {
+    // Determine base directories for each path
+    char* base_dir1 = tcp->current_dir;
+    char* base_dir2 = tcp->current_dir;
+    char* resolved_dirfd1 = NULL;
+    char* resolved_dirfd2 = NULL;
+    
+    // Check first path (oldpath with olddirfd arg[0])
+    if (!IS_ABSPATH(oldpath) && tcp->u_arg[0] != AT_FDCWD) {
+      resolved_dirfd1 = resolve_dirfd_path(tcp->pid, tcp->u_arg[0]);
+      if (resolved_dirfd1) {
+        base_dir1 = resolved_dirfd1;
+      }
+    }
+    
+    // Check second path (newpath with newdirfd arg[2])
+    if (!IS_ABSPATH(newpath) && tcp->u_arg[2] != AT_FDCWD) {
+      resolved_dirfd2 = resolve_dirfd_path(tcp->pid, tcp->u_arg[2]);
+      if (resolved_dirfd2) {
+        base_dir2 = resolved_dirfd2;
+      }
+    }
+    
+    char* redirected_oldpath = redirect_filename_into_cderoot(oldpath, base_dir1, tcp);
+    // first copy the origin file into cde-root/ before trying to rename it
+    copy_file_into_cde_root(oldpath, base_dir1);
 
-done:
+    char* redirected_newpath = redirect_filename_into_cderoot(newpath, base_dir2, tcp);
+
+    rename(redirected_oldpath, redirected_newpath);
+
+    free(redirected_oldpath);
+    free(redirected_newpath);
+    if (resolved_dirfd1) free(resolved_dirfd1);
+    if (resolved_dirfd2) free(resolved_dirfd2);
+  }
+
   free(oldpath);
   free(newpath);
 }
@@ -2407,8 +2520,32 @@ void CDE_end_file_renameat(struct tcb* tcp) {
   else {
     if (tcp->u_rval == 0) {
       char* filename1 = strcpy_from_child(tcp, tcp->u_arg[1]);
+      char* dst_filename = strcpy_from_child(tcp, tcp->u_arg[3]);
+      
+      // Determine base directories for each path
+      char* base_dir1 = tcp->current_dir;
+      char* base_dir2 = tcp->current_dir;
+      char* resolved_dirfd1 = NULL;
+      char* resolved_dirfd2 = NULL;
+      
+      // Check first path (oldpath with olddirfd arg[0])
+      if (!IS_ABSPATH(filename1) && tcp->u_arg[0] != AT_FDCWD) {
+        resolved_dirfd1 = resolve_dirfd_path(tcp->pid, tcp->u_arg[0]);
+        if (resolved_dirfd1) {
+          base_dir1 = resolved_dirfd1;
+        }
+      }
+      
+      // Check second path (newpath with newdirfd arg[2])
+      if (!IS_ABSPATH(dst_filename) && tcp->u_arg[2] != AT_FDCWD) {
+        resolved_dirfd2 = resolve_dirfd_path(tcp->pid, tcp->u_arg[2]);
+        if (resolved_dirfd2) {
+          base_dir2 = resolved_dirfd2;
+        }
+      }
+      
       char* redirected_filename1 =
-        redirect_filename_into_cderoot(filename1, tcp->current_dir, tcp);
+        redirect_filename_into_cderoot(filename1, base_dir1, tcp);
       free(filename1);
       // remove original file from cde-root/
       if (redirected_filename1) {
@@ -2417,9 +2554,11 @@ void CDE_end_file_renameat(struct tcb* tcp) {
       }
 
       // copy the destination file into cde-root/
-      char* dst_filename = strcpy_from_child(tcp, tcp->u_arg[3]);
-      copy_file_into_cde_root(dst_filename, tcp->current_dir);
+      copy_file_into_cde_root(dst_filename, base_dir2);
       free(dst_filename);
+      
+      if (resolved_dirfd1) free(resolved_dirfd1);
+      if (resolved_dirfd2) free(resolved_dirfd2);
     }
   }
 }

@@ -464,6 +464,17 @@ char* format(const char *format, ...) {
   return ptr;
 }
 
+int endswith(const char *path, const char *ext) {
+	int len_p = strlen(path);
+	int len_e = strlen(ext);
+
+	if (len_p < len_e) {
+		return 0;
+	}
+
+	return strcmp((path + len_p - len_e), ext);
+}
+
 /* If file is python cache file, copy its Python source file also */
 void copy_pycache_python_source(char* filename_abspath, char* src_prefix, char* dst_prefix) {
 

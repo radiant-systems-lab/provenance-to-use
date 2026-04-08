@@ -130,6 +130,8 @@ int dtime = 0, xflag = 0, qflag = 1; // pgbovine - turn on quiet mode (-q) by
                                      // default to shut up terminal line noise
 cflag_t cflag = CFLAG_NONE;
 static int iflag = 0, interactive = 0, pflag_seen = 0, rflag = 0, tflag = 0;
+static int pid_to_attach = -1, pid_to_attach_signal = -1, stop_tracing_from_signal = 0;
+
 /*
  * daemonized_tracer supports -D option.
  * With this option, strace forks twice.
@@ -527,12 +529,14 @@ startup_attach(void)
 				tcp->pid);
 	}
 
-	if (interactive)
+	if (interactive) {
 		sigprocmask(SIG_SETMASK, &empty_set, NULL);
+	}
+
 }
 
 static void
-startup_child (char **argv)
+startup_child (char **argv, int pid_to_attach)
 {
 	struct stat statbuf;
 	const char *filename;
@@ -622,16 +626,25 @@ startup_child (char **argv)
 			progname, filename, path_to_search);
 		exit(1);
 	}
-	strace_child = pid = fork();
-	if (pid < 0) {
-		perror("strace: fork");
-		cleanup();
-		exit(1);
+
+	if (pid_to_attach > 0) {
+		strace_child = pid = pid_to_attach;
+	} else {
+		strace_child = pid = fork();
+		if (pid < 0) {
+			perror("strace: fork");
+			cleanup();
+			exit(1);
+		}
 	}
+
 	if ((pid != 0 && daemonized_tracer) /* parent: to become a traced process */
 	 || (pid == 0 && !daemonized_tracer) /* child: to become a traced process */
+	 || (pid == pid_to_attach) /* external to become a traced process */
 	) {
-		pid = getpid();
+		if (pid == 0) {
+			pid = getpid();
+		}
 #ifdef USE_PROCFS
 		if (outf != stderr) close (fileno (outf));
 #ifdef MIPS
@@ -651,9 +664,16 @@ startup_child (char **argv)
 			close(fileno (outf));
 
 		if (!daemonized_tracer) {
-			if (ptrace(PTRACE_TRACEME, 0, (char *) 1, 0) < 0) {
-				perror("strace: ptrace(PTRACE_TRACEME, ...)");
-				exit(1);
+			if (pid_to_attach < 0 ) {
+				if (ptrace(PTRACE_TRACEME, 0, (char *) 1, 0) < 0) {
+					perror("strace: ptrace(PTRACE_TRACEME, ...)");
+					exit(1);
+				}
+			} else {
+				if (ptrace(PTRACE_ATTACH, pid_to_attach, (char *) 1, 0) < 0) {
+					perror("strace: ptrace(PTRACE_ATTACH, ...)");
+					exit(1);
+				}
 			}
 			if (debug)
 				kill(pid, SIGSTOP);
@@ -698,8 +718,11 @@ startup_child (char **argv)
 			 * Unless of course we're on a no-MMU system where
 			 * we vfork()-ed, so we cannot stop the child.
 			 */
-			if (!strace_vforked)
+			if (pid_to_attach > 0) {
+				kill(pid_to_attach, SIGSTOP);
+			} else if (!strace_vforked) {
 				kill(getpid(), SIGSTOP);
+			}
 		} else {
 			struct sigaction sv_sigchld;
 			sigaction(SIGCHLD, NULL, &sv_sigchld);
@@ -734,10 +757,12 @@ startup_child (char **argv)
       }
     }
 
-		execvp(pathname, argv);
-fprintf(stderr, "%s %d\n", pathname, cde_exec_from_outside_cderoot);
-		perror("strace: exec");
-		_exit(1);
+		if (pid_to_attach < 0) {
+			execvp(pathname, argv);
+			fprintf(stderr, "%s %d\n", pathname, cde_exec_from_outside_cderoot);
+			perror("strace: exec");
+			_exit(1);
+		}
 	}
 
 	/* We are the tracer.  */
@@ -1564,7 +1589,11 @@ cleanup()
 			detach(tcp, 0);
 		else {
 			kill(tcp->pid, SIGCONT);
-			kill(tcp->pid, SIGTERM);
+
+			if (pid_to_attach < 0) {
+				// don't kill the traced processed unless we created them
+				kill(tcp->pid, SIGTERM);
+			}
 		}
 	}
 	if (cflag)
@@ -2204,7 +2233,17 @@ trace()
 		if (interactive)
 			sigprocmask(SIG_BLOCK, &blocked_set, NULL);
 
-		if (pid == -1) {
+		if (pid_to_attach > 0) {
+			if (stop_tracing_from_signal) {
+				break;
+			}
+
+			int status = kill(pid_to_attach, 0);
+			if (status != 0) {
+				/* if we could not send checkup signal, process is gone */
+				break;
+			}
+		} else if (pid == -1) {
 			switch (wait_errno) {
 			case EINTR:
 				continue;
@@ -2624,6 +2663,10 @@ mp_ioctl(int fd, int cmd, void *arg, int size)
 
 #endif
 
+static void stop_tracing_sig_handler(int signo) {
+	stop_tracing_from_signal = 1;
+}
+
 /*******************************************************************************
  * PUBLIC INTERFACE
  ******************************************************************************/
@@ -2684,7 +2727,7 @@ int main (int argc, char *argv[]) {
 #ifndef USE_PROCFS
 		"D"
 #endif
-		"a:e:o:O:u:E:i:p:P:I:")) != EOF) {
+		"A:a:e:o:O:u:E:i:p:P:I:")) != EOF) {
 		switch (c) {
 		case 'c':
       // pgbovine - hijack for -c option
@@ -2855,6 +2898,9 @@ int main (int argc, char *argv[]) {
 		case 'w':
 			/*CDE_network_content_mode = 1;*/
 			break;
+		case 'A':
+			sscanf(optarg, "%d,%d", &pid_to_attach, &pid_to_attach_signal);
+			break;
 		default:
 			usage(stderr, 1);
 			break;
@@ -2888,12 +2934,19 @@ int main (int argc, char *argv[]) {
 	qualify("verbose=all");
 	qualify("signal=all");
 
-	if ((optind == argc) == !pflag_seen)
+	if (((optind == argc) == !pflag_seen) && pid_to_attach < 0)
 		usage(stderr, 1);
 
 	if (pflag_seen && daemonized_tracer) {
 		fprintf(stderr,
 			"%s: -D and -p are mutually exclusive options\n",
+			progname);
+		exit(1);
+	}
+
+	if (pid_to_attach > 0 && daemonized_tracer) {
+		fprintf(stderr,
+			"%s: -D and -A are mutually exclusive options\n",
 			progname);
 		exit(1);
 	}
@@ -2984,6 +3037,34 @@ int main (int argc, char *argv[]) {
 	 */
 
 
+	if (pid_to_attach > 0) {
+		// If attaching to a pid, then pretend that the executable name
+		// was given in argv. We construct new argvs accordingly.
+		// so that the rest of code does not change.
+		
+		char pid_symlink_name[MAXPATHLEN];
+		char pid_symlink_exe[MAXPATHLEN];
+		int pid_symlink_status;
+
+		snprintf(pid_symlink_exe, MAXPATHLEN, "/proc/%d/exe", pid_to_attach);
+		pid_symlink_status = readlink(pid_symlink_exe, pid_symlink_name, MAXPATHLEN);
+		if (pid_symlink_status < 0) {
+			perror("strace: exec readlink");
+			exit(1);
+		}
+		perror(pid_symlink_name);
+
+		char **new_argv = malloc(2 * sizeof(char *));
+		new_argv[0] = malloc(MAXPATHLEN * sizeof(char));
+		new_argv[1] = malloc(MAXPATHLEN * sizeof(char));
+
+		strncpy(new_argv[0], argv[0], MAXPATHLEN);
+		strncpy(new_argv[1], pid_symlink_name, MAXPATHLEN);
+
+		argv = new_argv;
+		optind = 1;
+	}
+
 	// pgbovine - do all CDE initialization here after command-line options
 	// have been processed (argv[optind] is the name of the target program)
 	extern void CDE_init(char** argv, int optind);
@@ -3003,11 +3084,18 @@ int main (int argc, char *argv[]) {
 	   Also we do not need to be protected by them as during interruption
 	   in the STARTUP_CHILD mode we kill the spawned process anyway.  */
 	if (!pflag_seen)
-		startup_child(&argv[optind]);
+		startup_child(&argv[optind], pid_to_attach);
 
 	sigemptyset(&empty_set);
 	sigemptyset(&blocked_set);
-	sa.sa_handler = SIG_IGN;
+
+	if (pid_to_attach > 0) {
+		// If attaching to an external pid, stop tracing when receiving a signal
+		sa.sa_handler = stop_tracing_sig_handler;
+	}
+	else {
+		sa.sa_handler = SIG_IGN;
+	}
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = 0;
 	sigaction(SIGTTOU, &sa, NULL);
@@ -3025,10 +3113,11 @@ int main (int argc, char *argv[]) {
 #endif /* SUNOS4 */
 	}
 	sigaction(SIGHUP, &sa, NULL);
+	sigaction(SIGPIPE, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGQUIT, &sa, NULL);
-	sigaction(SIGPIPE, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
+
 #ifdef USE_PROCFS
 	sa.sa_handler = reaper;
 	sigaction(SIGCHLD, &sa, NULL);
@@ -3042,8 +3131,13 @@ int main (int argc, char *argv[]) {
 	sigaction(SIGCHLD, &sa, NULL);
 #endif /* USE_PROCFS */
 
-	if (pflag_seen || daemonized_tracer)
+	if (pflag_seen || daemonized_tracer || pid_to_attach > 0)
 		startup_attach();
+
+	if (pid_to_attach > 0 && pid_to_attach_signal > -1) {
+		/* send requested signal to external pid */
+		kill(pid_to_attach, pid_to_attach_signal);
+	}
 
 	if (trace() < 0)
 		exit(1);

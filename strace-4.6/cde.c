@@ -3451,6 +3451,23 @@ void CDE_init(char** argv, int optind) {
     fputc('\n', log_f);
     fclose(log_f);
 
+    // Open manifest log in log-only mode (-b / Prov_no_app_capture).
+    // Records every file that WOULD enter cde-root (type, perms, symlink targets)
+    // so the container can be materialized later without re-running PTU.
+    if (Prov_no_app_capture) {
+      char* manifest_fn = format("%s/cde.manifest", CDE_PACKAGE_DIR);
+      Prov_manifest_logfile = fopen(manifest_fn, "w");
+      if (Prov_manifest_logfile) {
+        fprintf(Prov_manifest_logfile, "# cde.manifest v1\n");
+        fprintf(Prov_manifest_logfile, "# Format: TYPE MODE ABSPATH [SYMLINK_TARGET]\n");
+        fprintf(Prov_manifest_logfile, "#   F mode path          regular file\n");
+        fprintf(Prov_manifest_logfile, "#   L mode path target   symlink\n");
+        fprintf(Prov_manifest_logfile, "#   D mode path          directory\n");
+        fflush(Prov_manifest_logfile);
+      }
+      free(manifest_fn);
+    }
+
     CDE_create_path_symlink_dirs();
 
     CDE_create_toplevel_symlink_dirs();
@@ -4055,9 +4072,126 @@ int is_cde_binary(const char *str) {
         endswith(str, "/ptu-exec");
 }
 
+// Write one entry to the manifest log (called from cde.c and okapi.c).
+// Format per line:
+//   F <mode_octal> <abspath>              regular file
+//   L <mode_octal> <abspath> <target>     symlink + its readlink() target
+//   D <mode_octal> <abspath>              directory
+// abspath is on the SOURCE filesystem; same path goes under cde-root/ on replay.
+
+// Open-addressing hash set to deduplicate manifest writes at record time.
+// Keyed on raw input path (src_prefix+abspath) before canonicalization.
+// Eliminates redundant lstat/realpath calls for the same path (17x average
+// duplication ratio observed in practice).
+#define MANIFEST_SEEN_SLOTS 8192  // must be power of 2
+static char*  manifest_seen_keys[MANIFEST_SEEN_SLOTS];
+static int    manifest_seen_init = 0;
+
+static unsigned long djb2(const char* s) {
+  unsigned long h = 5381;
+  while (*s) h = ((h << 5) + h) ^ (unsigned char)*s++;
+  return h;
+}
+
+// Returns 1 if path already recorded; 0 and inserts if not.
+// Must be called under Prov_manifest_mutex.
+static int manifest_seen_check_and_insert(const char* path) {
+  if (!manifest_seen_init) {
+    memset(manifest_seen_keys, 0, sizeof(manifest_seen_keys));
+    manifest_seen_init = 1;
+  }
+  unsigned slot = djb2(path) & (MANIFEST_SEEN_SLOTS - 1);
+  for (int i = 0; i < MANIFEST_SEEN_SLOTS; i++) {
+    unsigned s = (slot + i) & (MANIFEST_SEEN_SLOTS - 1);
+    if (!manifest_seen_keys[s]) {
+      manifest_seen_keys[s] = strdup(path);
+      return 0;  // not seen before
+    }
+    if (strcmp(manifest_seen_keys[s], path) == 0) return 1;  // already logged
+  }
+  return 0;  // table full — allow re-log rather than silently drop
+}
+
+void write_manifest_entry(const char* abspath, const char* src_prefix) {
+  if (!Prov_manifest_logfile) return;
+
+  const char* pfx = src_prefix ? src_prefix : "";
+  int pfx_len = strlen(pfx);
+
+  char full_path[MAXPATHLEN];
+  snprintf(full_path, sizeof(full_path), "%s%s", pfx, abspath);
+
+  // Fast dedup: skip lstat/realpath/fprintf for paths we've already logged.
+  pthread_mutex_lock(&Prov_manifest_mutex);
+  if (manifest_seen_check_and_insert(full_path)) {
+    pthread_mutex_unlock(&Prov_manifest_mutex);
+    return;
+  }
+  pthread_mutex_unlock(&Prov_manifest_mutex);
+
+  struct stat st;
+  if (lstat(full_path, &st) != 0) return;  // source missing, skip
+
+  pthread_mutex_lock(&Prov_manifest_mutex);
+  if (S_ISLNK(st.st_mode)) {
+    // Symlinks: resolve the PARENT dir via realpath() (handles all levels of
+    // chained intermediate symlinks, e.g. /lib64 -> usr/lib64) so the logged
+    // path matches the canonical location in cde-root.  Only the final
+    // component (the symlink itself) is kept as-is; its target is unchanged.
+    char target[MAXPATHLEN];
+    ssize_t len = readlink(full_path, target, sizeof(target) - 1);
+    if (len > 0) {
+      target[len] = '\0';
+      const char* log_path = abspath;
+      char canonical_symlink[MAXPATHLEN];
+      char full_path_copy[MAXPATHLEN];
+      snprintf(full_path_copy, sizeof(full_path_copy), "%s", full_path);
+      char* dir_part = dirname(full_path_copy);  // dirname() modifies its arg
+      char resolved_dir[MAXPATHLEN];
+      if (realpath(dir_part, resolved_dir)) {
+        const char* base = strrchr(abspath, '/');  // includes leading '/'
+        if (base) {
+          const char* resolved_dir_suffix = resolved_dir + pfx_len;
+          // When resolved dir is root "/", suffix is "/" — avoid "//basename".
+          if (strcmp(resolved_dir_suffix, "/") == 0) resolved_dir_suffix = "";
+          if (resolved_dir_suffix[0] == '/' || resolved_dir_suffix[0] == '\0') {
+            snprintf(canonical_symlink, sizeof(canonical_symlink), "%s%s",
+                     resolved_dir_suffix, base);
+            log_path = canonical_symlink;
+          }
+        }
+      }
+      fprintf(Prov_manifest_logfile, "L %06o %s %s\n",
+              (unsigned)(st.st_mode & 07777), log_path, target);
+    }
+  } else {
+    // Files and dirs: resolve to canonical path so intermediate symlinks
+    // in the path (e.g. /lib -> usr/lib) don't cause the materializer to
+    // create conflicting real directories before the symlink entry is processed.
+    const char* log_path = abspath;
+    char resolved[MAXPATHLEN];
+    if (realpath(full_path, resolved)) {
+      // Strip src_prefix to get the host-absolute path for the manifest.
+      const char* suffix = resolved + pfx_len;
+      if (suffix[0] == '/') {
+        log_path = suffix;
+      }
+    }
+    if (S_ISDIR(st.st_mode)) {
+      fprintf(Prov_manifest_logfile, "D %06o %s\n",
+              (unsigned)(st.st_mode & 07777), log_path);
+    } else if (S_ISREG(st.st_mode)) {
+      fprintf(Prov_manifest_logfile, "F %06o %s\n",
+              (unsigned)(st.st_mode & 07777), log_path);
+    }
+  }
+  pthread_mutex_unlock(&Prov_manifest_mutex);
+}
+
 void create_mirror_file_in_cde_package(char* filename_abspath, char* src_prefix, char* dst_prefix) {
-  if (!Prov_no_app_capture)
-    create_mirror_file(filename_abspath, src_prefix, dst_prefix);
+  // Always call create_mirror_file: it handles both normal copy and
+  // log-only mode (Prov_no_app_capture) by guarding filesystem ops internally.
+  create_mirror_file(filename_abspath, src_prefix, dst_prefix);
   if (Cde_verbose_mode) {
     vbprintf("  mirror_f: %s, %s, %s\n", filename_abspath, src_prefix, dst_prefix);
   }
@@ -4072,8 +4206,8 @@ void make_mirror_dirs_in_cde_package(char* original_abspath, int pop_one) {
   //TODO: check original_abspath with CDE_PACKAGE_DIR
   // so we won't make unnecessary path like: ~/assi/cde/mytest/bash/cde-package/pkg02/home/quanpt/assi/cde/mytest/
   //   bash/cde-package/cde-root/home/quanpt/assi/cde/mytest/bash
-  if (!Prov_no_app_capture)
-    create_mirror_dirs(original_abspath, (char*)"", CDE_ROOT_DIR, pop_one);
+  // Always call create_mirror_dirs; it guards mkdir internally in log-only mode.
+  create_mirror_dirs(original_abspath, (char*)"", CDE_ROOT_DIR, pop_one);
   if (Cde_verbose_mode) {
     vbprintf("  mirror_d: %s, %s\n", original_abspath, CDE_ROOT_DIR);
   }

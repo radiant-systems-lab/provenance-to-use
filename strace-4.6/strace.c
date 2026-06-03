@@ -1569,6 +1569,10 @@ cleanup()
 	}
 	if (cflag)
 		call_summary(outf);
+	if (Prov_manifest_logfile) {
+		fclose(Prov_manifest_logfile);
+		Prov_manifest_logfile = NULL;
+	}
 }
 
 static void

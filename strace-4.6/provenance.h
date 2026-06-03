@@ -14,6 +14,13 @@ struct tcb;       // defs.h (strace module): process trace control block
 extern char Prov_prov_mode;        // true if auditing (opposite of Cde_exec_mode)
 extern char Prov_no_app_capture;   // if true, run cde to collect prov but don't capture app
 
+// Manifest log: written in log-only mode (-b) to record all files that would
+// go into cde-root (type, permissions, symlink targets) for deferred materialization.
+#include <stdio.h>
+#include <pthread.h>
+extern FILE* Prov_manifest_logfile;
+extern pthread_mutex_t Prov_manifest_mutex;
+
 /*******************************************************************************
  * PUBLIC MACROS / FUNCTIONS
  ******************************************************************************/

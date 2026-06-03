@@ -36,6 +36,12 @@ extern int string_quote (const char* instr, char* outstr, int len, int size); //
 char Prov_prov_mode = 0;       // true if auditing (opposite of Cde_exec_mode)
 char Prov_no_app_capture = 0;  // if true, run cde to collect prov but don't capture app
 
+// Manifest log file: written when Prov_no_app_capture=1 to record every file
+// that WOULD have been copied into cde-root, including type, permissions, and
+// symlink targets. Materializer reads this to reconstruct the container later.
+FILE* Prov_manifest_logfile = NULL;
+pthread_mutex_t Prov_manifest_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /*******************************************************************************
  * PRIVATE TYPES / CONSTANTS / VARIABLES
  ******************************************************************************/

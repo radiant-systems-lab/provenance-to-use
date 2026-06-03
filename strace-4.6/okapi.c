@@ -69,6 +69,10 @@ CDE is currently licensed under GPL v3:
 
 #include "okapi.h"
 #include "perftimers.h"   // performance timing of certain code segments
+#include "provenance.h"   // Prov_no_app_capture, Prov_manifest_logfile
+
+// write_manifest_entry is defined in cde.c
+extern void write_manifest_entry(const char* abspath, const char* src_prefix);
 
 /*******************************************************************************
  * IMPLEMENTATION
@@ -484,7 +488,11 @@ void copy_pycache_python_source(char* filename_abspath, char* src_prefix, char* 
         char* src_path = format("%s%s%s", python_source_file_path, "/", python_source_file_name);
         char* dst_path = format("%s%s", dst_prefix, src_path);
 
-        copy_file(src_path, dst_path, 0);
+        if (!Prov_no_app_capture) {
+          copy_file(src_path, dst_path, 0);
+        }
+        // Log the .py companion file regardless of mode so materializer can fetch it.
+        write_manifest_entry(src_path, (char*)"");
 
         free(python_source_file_path);
         free(python_source_file_name);
@@ -556,6 +564,7 @@ void create_mirror_file(char* filename_abspath, char* src_prefix, char* dst_pref
 
   // if it's a symlink, copy both it and its target
   if (is_symlink) {
+    // create_mirror_symlink_and_target handles manifest logging and guards ops internally
     create_mirror_symlink_and_target(filename_abspath, src_prefix, dst_prefix);
   }
   else {
@@ -563,9 +572,12 @@ void create_mirror_file(char* filename_abspath, char* src_prefix, char* dst_pref
       // create all the directories leading up to it, to make sure file
       // copying/hard-linking will later succeed
       create_mirror_dirs(filename_abspath, src_prefix, dst_prefix, 1);
-     
+
       // copy original python source based on pycache file
       copy_pycache_python_source(filename_abspath, src_prefix, dst_prefix);
+
+      // Log this regular file to manifest regardless of mode
+      write_manifest_entry(filename_abspath, src_prefix);
 
       // 1.) try a hard link for efficiency
       // 2.) if that fails, then do a straight-up copy,
@@ -574,11 +586,15 @@ void create_mirror_file(char* filename_abspath, char* src_prefix, char* dst_pref
       // EEXIST means the file already exists, which isn't
       // really a hard link failure ...
 
-      if ((link(src_path, dst_path) != 0) && (errno != EEXIST)) {
-        copy_file(src_path, dst_path, 0);
+      if (!Prov_no_app_capture) {
+        if ((link(src_path, dst_path) != 0) && (errno != EEXIST)) {
+          copy_file(src_path, dst_path, 0);
+        }
       }
     }
     else if (S_ISDIR(src_path_stat.st_mode)) { // directory or symlink to directory
+      // Log directory; create_mirror_dirs guards mkdir internally
+      write_manifest_entry(filename_abspath, src_prefix);
       create_mirror_dirs(filename_abspath, src_prefix, dst_prefix, 0);
     }
   }
@@ -629,15 +645,21 @@ void create_mirror_dirs(char* original_abspath, char* src_prefix, char* dst_pref
       if (lstat(src_dirname, &src_dn_stat) == 0) { // this does NOT follow the symlink
         char is_symlink = S_ISLNK(src_dn_stat.st_mode);
         if (is_symlink) {
+          // create_mirror_symlink_and_target handles manifest logging and guards ops
           create_mirror_symlink_and_target(dn, src_prefix, dst_prefix);
         }
         else {
           assert(S_ISDIR(src_dn_stat.st_mode));
 
+          // Log this directory component to manifest
+          write_manifest_entry(dn, src_prefix);
+
           // create required dir, and optionally track time of creating
-          start_perf_timer(AUDIT_FILE_COPYING);
-          mkdir(dst_dirname, 0777);
-          stop_perf_timer(AUDIT_FILE_COPYING);
+          if (!Prov_no_app_capture) {
+            start_perf_timer(AUDIT_FILE_COPYING);
+            mkdir(dst_dirname, 0777);
+            stop_perf_timer(AUDIT_FILE_COPYING);
+          }
         }
       }
 
@@ -736,27 +758,38 @@ void create_mirror_symlink_and_target(char* filename_abspath, char* src_prefix, 
     assert(strncmp(relative_symlink_target, "./", 2) == 0);
     assert(strstr(relative_symlink_target, "//"));
 
+    // Log symlink with its original (absolute) target for faithful replay
+    write_manifest_entry(filename_abspath, src_prefix);
+
     // EEXIST means the file already exists, which isn't really a symlink failure ...
     // create required symlink, and optionally track time of creating
-    start_perf_timer(AUDIT_FILE_COPYING);
-    if (symlink(relative_symlink_target, dst_symlink_path) != 0 && (errno != EEXIST)) {
-      if (OKAPI_VERBOSE) {
-        fprintf(stderr, "WARNING: symlink('%s', '%s') failed\n", relative_symlink_target, dst_symlink_path);
+    if (!Prov_no_app_capture) {
+      start_perf_timer(AUDIT_FILE_COPYING);
+      if (symlink(relative_symlink_target, dst_symlink_path) != 0 && (errno != EEXIST)) {
+        if (OKAPI_VERBOSE) {
+          fprintf(stderr, "WARNING: symlink('%s', '%s') failed\n", relative_symlink_target, dst_symlink_path);
+        }
       }
+      stop_perf_timer(AUDIT_FILE_COPYING);
     }
-    stop_perf_timer(AUDIT_FILE_COPYING);
   }
   else {
     symlink_target_abspath = format("%s/%s", dir_realpath, orig_symlink_target);
+
+    // Log symlink with its relative target for faithful replay
+    write_manifest_entry(filename_abspath, src_prefix);
+
     // EEXIST means the file already exists, which isn't really a symlink failure ...
     // create required symlink, and optionally track time of creating
-    start_perf_timer(AUDIT_FILE_COPYING);
-    if (symlink(orig_symlink_target, dst_symlink_path) != 0 && (errno != EEXIST)) {
-      if (OKAPI_VERBOSE) {
-        fprintf(stderr, "WARNING: symlink('%s', '%s') failed\n", orig_symlink_target, dst_symlink_path);
+    if (!Prov_no_app_capture) {
+      start_perf_timer(AUDIT_FILE_COPYING);
+      if (symlink(orig_symlink_target, dst_symlink_path) != 0 && (errno != EEXIST)) {
+        if (OKAPI_VERBOSE) {
+          fprintf(stderr, "WARNING: symlink('%s', '%s') failed\n", orig_symlink_target, dst_symlink_path);
+        }
       }
+      stop_perf_timer(AUDIT_FILE_COPYING);
     }
-    stop_perf_timer(AUDIT_FILE_COPYING);
   }
 
   assert(symlink_target_abspath);
@@ -831,8 +864,13 @@ void create_mirror_symlink_and_target(char* filename_abspath, char* src_prefix, 
       // symlink_dst_abspath if they don't yet exist
       create_mirror_dirs(symlink_dst_original_path_suffix, src_prefix, dst_prefix, 1);
 
-      if ((link(symlink_target_abspath, symlink_dst_abspath) != 0) && (errno != EEXIST)) {
-        copy_file(symlink_target_abspath, symlink_dst_abspath, 0);
+      // Log the terminal target file for faithful replay
+      write_manifest_entry(symlink_dst_original_path_suffix, src_prefix);
+
+      if (!Prov_no_app_capture) {
+        if ((link(symlink_target_abspath, symlink_dst_abspath) != 0) && (errno != EEXIST)) {
+          copy_file(symlink_target_abspath, symlink_dst_abspath, 0);
+        }
       }
     }
     else if (S_ISDIR(symlink_target_stat.st_mode)) { // symlink to directory

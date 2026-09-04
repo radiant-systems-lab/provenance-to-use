@@ -889,7 +889,19 @@ void copy_file(char* src_filename, char* dst_filename, int perms) {
 
   inF = open(src_filename, O_RDONLY); // note that we might not have permission to open src_filename
   if ((outF = open(dst_filename, O_WRONLY | O_CREAT, perms)) < 0) {
-    fprintf(stderr, "Error in copy_file: cannot create '%s'\n", dst_filename);
+    int copy_file_errno = errno;
+    struct stat existing_dst_stat;
+    if (stat(dst_filename, &existing_dst_stat) == 0 && S_ISREG(existing_dst_stat.st_mode))
+    {
+      // destination already exists as a real file, i.e., another copy already
+      // succeeded, so this failure is harmless. Don't abort the capture.
+      if (inF >= 0)
+        close(inF);
+      stop_perf_timer(AUDIT_FILE_COPYING);
+      return;
+    }
+    fprintf(stderr, "Error in copy_file: cannot create '%s': %s (errno=%d)\n",
+            dst_filename, strerror(copy_file_errno), copy_file_errno);
     exit(1);
   }
 

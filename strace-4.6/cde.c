@@ -66,7 +66,7 @@
 char Cde_verbose_mode = 0;    // print cde activity to stdout (-v option)
 char Cde_exec_mode = 0;       // false if auditing, true if running captured app
 char Cde_app_dir[MAXPATHLEN]; // abs path to cde app dir (contains cde-root)
-
+#define IS_DIRFD_CWD(dirfd_arg) ((int)(dirfd_arg) == AT_FDCWD)  // for correct comparison of fds with AT_FDCWD
 /*******************************************************************************
  * PRIVATE CONSTANTS / VARIABLES
  ******************************************************************************/
@@ -842,7 +842,7 @@ static void modify_syscall_second_and_fourth_args(struct tcb* tcp) {
   char* resolved_dirfd2 = NULL;
   
   // Check first path (arg[1] with dirfd arg[0])
-  if (!IS_ABSPATH(filename1) && tcp->u_arg[0] != AT_FDCWD) {
+  if (!IS_ABSPATH(filename1) && !IS_DIRFD_CWD(tcp->u_arg[0])) {
     resolved_dirfd1 = resolve_dirfd_path(tcp->pid, tcp->u_arg[0]);
     if (resolved_dirfd1) {
       base_dir1 = resolved_dirfd1;
@@ -850,7 +850,7 @@ static void modify_syscall_second_and_fourth_args(struct tcb* tcp) {
   }
   
   // Check second path (arg[3] with dirfd arg[2])
-  if (!IS_ABSPATH(filename2) && tcp->u_arg[2] != AT_FDCWD) {
+  if (!IS_ABSPATH(filename2) && !IS_DIRFD_CWD(tcp->u_arg[2])) {
     resolved_dirfd2 = resolve_dirfd_path(tcp->pid, tcp->u_arg[2]);
     if (resolved_dirfd2) {
       base_dir2 = resolved_dirfd2;
@@ -957,7 +957,7 @@ static void modify_syscall_first_and_third_args(struct tcb* tcp) {
   char* resolved_dirfd2 = NULL;
   
   // Check second path (filename2 with dirfd arg[1])
-  if (!IS_ABSPATH(filename2) && tcp->u_arg[1] != AT_FDCWD) {
+  if (!IS_ABSPATH(filename2) && !IS_DIRFD_CWD(tcp->u_arg[1])) {
     resolved_dirfd2 = resolve_dirfd_path(tcp->pid, tcp->u_arg[1]);
     if (resolved_dirfd2) {
       base_dir2 = resolved_dirfd2;
@@ -1200,7 +1200,7 @@ void CDE_begin_at_fileop(struct tcb* tcp, const char* syscall_name) {
   }
 
   // Handle relative paths with custom dirfd by resolving the dirfd path
-  if (!IS_ABSPATH(filename) && tcp->u_arg[0] != AT_FDCWD) {
+  if (!IS_ABSPATH(filename) && !IS_DIRFD_CWD(tcp->u_arg[0])) {
     resolved_dirfd_path = resolve_dirfd_path(tcp->pid, tcp->u_arg[0]);
     if (resolved_dirfd_path) {
       effective_base_dir = resolved_dirfd_path;
@@ -2224,7 +2224,7 @@ void CDE_begin_file_unlinkat(struct tcb* tcp) {
   }
 
   // Handle relative paths with custom dirfd by resolving the dirfd path
-  if (!IS_ABSPATH(filename) && tcp->u_arg[0] != AT_FDCWD) {
+  if (!IS_ABSPATH(filename) && !IS_DIRFD_CWD(tcp->u_arg[0])) {
     resolved_dirfd_path = resolve_dirfd_path(tcp->pid, tcp->u_arg[0]);
     if (resolved_dirfd_path) {
       effective_base_dir = resolved_dirfd_path;
@@ -2317,7 +2317,7 @@ void CDE_begin_file_linkat(struct tcb* tcp) {
     char* resolved_dirfd2 = NULL;
     
     // Check first path (oldpath with dirfd arg[0])
-    if (!IS_ABSPATH(oldpath) && tcp->u_arg[0] != AT_FDCWD) {
+    if (!IS_ABSPATH(oldpath) && !IS_DIRFD_CWD(tcp->u_arg[0])) {
       resolved_dirfd1 = resolve_dirfd_path(tcp->pid, tcp->u_arg[0]);
       if (resolved_dirfd1) {
         base_dir1 = resolved_dirfd1;
@@ -2325,7 +2325,7 @@ void CDE_begin_file_linkat(struct tcb* tcp) {
     }
     
     // Check second path (newpath with dirfd arg[2])
-    if (!IS_ABSPATH(newpath) && tcp->u_arg[2] != AT_FDCWD) {
+    if (!IS_ABSPATH(newpath) && !IS_DIRFD_CWD(tcp->u_arg[2])) {
       resolved_dirfd2 = resolve_dirfd_path(tcp->pid, tcp->u_arg[2]);
       if (resolved_dirfd2) {
         base_dir2 = resolved_dirfd2;
@@ -2395,7 +2395,7 @@ void CDE_begin_file_symlinkat(struct tcb* tcp) {
     char* resolved_dirfd = NULL;
     
     // Check newpath (arg[2] with dirfd arg[1])
-    if (!IS_ABSPATH(newpath) && tcp->u_arg[1] != AT_FDCWD) {
+    if (!IS_ABSPATH(newpath) && !IS_DIRFD_CWD(tcp->u_arg[1])) {
       resolved_dirfd = resolve_dirfd_path(tcp->pid, tcp->u_arg[1]);
       if (resolved_dirfd) {
         base_dir = resolved_dirfd;
@@ -2476,7 +2476,7 @@ void CDE_begin_file_renameat(struct tcb* tcp) {
     char* resolved_dirfd2 = NULL;
     
     // Check first path (oldpath with olddirfd arg[0])
-    if (!IS_ABSPATH(oldpath) && tcp->u_arg[0] != AT_FDCWD) {
+    if (!IS_ABSPATH(oldpath) && !IS_DIRFD_CWD(tcp->u_arg[0])) {
       resolved_dirfd1 = resolve_dirfd_path(tcp->pid, tcp->u_arg[0]);
       if (resolved_dirfd1) {
         base_dir1 = resolved_dirfd1;
@@ -2484,7 +2484,7 @@ void CDE_begin_file_renameat(struct tcb* tcp) {
     }
     
     // Check second path (newpath with newdirfd arg[2])
-    if (!IS_ABSPATH(newpath) && tcp->u_arg[2] != AT_FDCWD) {
+    if (!IS_ABSPATH(newpath) && !IS_DIRFD_CWD(tcp->u_arg[2])) {
       resolved_dirfd2 = resolve_dirfd_path(tcp->pid, tcp->u_arg[2]);
       if (resolved_dirfd2) {
         base_dir2 = resolved_dirfd2;
@@ -2529,7 +2529,7 @@ void CDE_end_file_renameat(struct tcb* tcp) {
       char* resolved_dirfd2 = NULL;
       
       // Check first path (oldpath with olddirfd arg[0])
-      if (!IS_ABSPATH(filename1) && tcp->u_arg[0] != AT_FDCWD) {
+      if (!IS_ABSPATH(filename1) && !IS_DIRFD_CWD(tcp->u_arg[0])) {
         resolved_dirfd1 = resolve_dirfd_path(tcp->pid, tcp->u_arg[0]);
         if (resolved_dirfd1) {
           base_dir1 = resolved_dirfd1;
@@ -2537,7 +2537,7 @@ void CDE_end_file_renameat(struct tcb* tcp) {
       }
       
       // Check second path (newpath with newdirfd arg[2])
-      if (!IS_ABSPATH(dst_filename) && tcp->u_arg[2] != AT_FDCWD) {
+      if (!IS_ABSPATH(dst_filename) && !IS_DIRFD_CWD(tcp->u_arg[2])) {
         resolved_dirfd2 = resolve_dirfd_path(tcp->pid, tcp->u_arg[2]);
         if (resolved_dirfd2) {
           base_dir2 = resolved_dirfd2;
